@@ -45,7 +45,9 @@ async function joinViaLogin(url: string, host: string): Promise<string | null> {
 
 /** `hub init [<hub-url>] [--token <machine-token>]` (the default): join an existing hub as a worker and mirror its data.
  *  `hub init --primary`: the fleet's one primary: deploy your own Worker, seed templates, push them.
- *  A host already set up as the primary (or already joined) keeps its role when init runs again. */
+ *  A host already set up as the primary (or already joined) keeps its role when init runs again.
+ *  Exit 2 means "needs an answer only the owner has" (no noop to join, or a URL/token that does not work):
+ *  install.sh asks the question rather than calling the AI medic, which cannot know the answer either. */
 export async function init(opts: { worker?: string; token?: string; primary?: boolean } = {}) {
   const { commitPush, pull, loadConfig, hostName } = await import("./core");
   const { readHubToml, syncMode, writeHubToml } = await import("./sync");
@@ -55,11 +57,11 @@ export async function init(opts: { worker?: string; token?: string; primary?: bo
   const primaryHere = existsSync(P("config.toml")) && new RegExp(`^\\s*primary\\s*=\\s*"${me}"`, "m").test(readFileSync(P("config.toml"), "utf8"));
   if (!opts.primary && !primaryHere) {
     const url = (opts.worker || joined || (prompt("your noop URL (e.g. https://noop.example.com; set up the first machine with --primary):") ?? "")).trim().replace(/\/$/, "");
-    if (!url) { console.error("no noop URL: run init <noop-url>, or init --primary on the machine that hosts it"); process.exitCode = 1; return; }
+    if (!url) { console.error("no noop URL: run init <noop-url>, or init --primary on the machine that hosts it"); process.exitCode = 2; return; }
     const token = opts.token ?? (url === joined ? readHubToml().server?.token : undefined) ?? await joinViaLogin(url, me);
     if (!token) return;
     writeHubToml({ cloud: { url }, server: { token } });
-    if (!(await pull())) { console.error(`could not sync from ${url} (check the URL / token)`); process.exitCode = 1; return; }
+    if (!(await pull())) { console.error(`could not sync from ${url} (check the URL / token)`); process.exitCode = 2; return; }
     writeLocalConfig(me);
     console.log(`✔ joined ${url}; data mirrored to ${DATA}\n  next: hub install   (runs the daemon as a service)`);
     return;

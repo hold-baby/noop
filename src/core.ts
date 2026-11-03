@@ -203,11 +203,12 @@ export const which = (bin: string) => Bun.which(bin) !== null;
 
 /** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
  *  Unplanned tasks may use either, Claude first. */
+/** CLIs a task may run on, best first. A pinned `cli` (set by the planner or a routine) only goes first: the others
+ *  stay as fallbacks, otherwise a task pinned to a CLI no host has installed is never claimed. */
 export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
-  if (meta.cli && meta.cli !== "auto") return [meta.cli];
-  const per = cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined;
-  if (per) return per;
-  return ["claude", "codex"];
+  const base = (cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined) ?? ["claude", "codex"];
+  if (meta.cli && meta.cli !== "auto") return [meta.cli, ...base.filter((c) => c !== meta.cli)];
+  return base;
 }
 
 export function chooseCli(meta: Record<string, string>, cfg: Cfg): string | null {

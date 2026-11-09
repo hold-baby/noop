@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 // hub — CLI + daemon for the agent fleet.
+import { $ } from "bun";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
@@ -16,18 +17,21 @@ import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { init, install, selfUpdate } from "./setup";
 import { computeMetrics } from "./metrics";
+import { writeUsageReport } from "./usage-report";
+import { supervise } from "./supervisor";
 import { collect, LEARN_PROMPT } from "./sessions";
 import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
 import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
-import { reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataActs, localStore, logBrain, think } from "./brain";
+import { followUpTarget, reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataActs, localStore, logBrain, think } from "./brain";
 import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
 import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
+import { channelPrompt, channels, resolveChannels, updateChannel } from "./channels";
 
 // ------------------------------------------------------------------ routines (scheduled task generators)
 const STATE = P("logs", "routine-state.json");
@@ -54,7 +58,8 @@ export function due(every: string, last: string | undefined, t = new Date()): bo
  * A failing command counts as changed (the agent then looks). */
 export function signalChanged(r: { name: string; signal?: string }, state: Record<string, string>): boolean {
   const key = `${r.name}#signal`;
-  const res = Bun.spawnSync(["bash", "-lc", r.signal!], { cwd: existsSync(ROOT) ? ROOT : undefined, stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+  // Non-login: the service already carries the user's PATH, and sourcing their profile can cost seconds (conda, etc.).
+  const res = Bun.spawnSync(["bash", "-c", r.signal!], { cwd: existsSync(ROOT) ? ROOT : undefined, stdout: "pipe", stderr: "pipe", timeout: 60_000 });
   if (res.exitCode !== 0) return true;
   const hash = new Bun.CryptoHasher("sha1").update(res.stdout).digest("hex");
   if (state[key] === hash) return false;
@@ -79,15 +84,27 @@ function runRoutines(cfg: Cfg, host: string, primary: boolean) {
       journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${id}`);
       continue;
     }
-    const queued = routineQueued(r.name); // a copy queued or running → this run is redundant
+    if (r.kind === "usage-report") { // computed by code, posted to the main chat; no task, no model cost
+      state[r.name] = new Date().toISOString();
+      try {
+        const rep = writeUsageReport();
+        appendEvent({ from: "hub", kind: "notice", text: rep.markdown });
+        journal(host, `📊 usage report → ${rep.file}`);
+      } catch (e) { journal(host, `📊 usage report failed: ${(e as Error).message}`); }
+      continue;
+    }
+    // scheduler "each": every machine runs its own copy, pinned to it (e.g. the weekly security check of this computer)
+    const pin = owner === "each" ? host : undefined;
+    const queued = routineQueued(r.name, pin); // a copy queued or running → this run is redundant
     if (queued) { state[r.name] = new Date().toISOString(); journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`); continue; }
     if (r.signal && !signalChanged(r, state)) { state[r.name] = new Date().toISOString(); continue; } // nothing new → no AI run
     if (r.agent === "architect") computeMetrics(r.name === "evolve-deep" ? 30 : 7);
     const prompt = r.readonly ? `${r.prompt}\n\nRead-only routine: observe and report only. Do not change code, PRs, issues or settings; propose any change as a follow-up.` : r.prompt;
-    const id = newTask(`${r.name} · ${new Date().toLocaleString("sv-SE").slice(0, 16)}`, prompt, {
+    const id = newTask(`${r.name}${pin ? ` · ${pin}` : ""} · ${new Date().toLocaleString("sv-SE").slice(0, 16)}`, prompt, {
       agent: r.agent, cli: r.cli, requires: r.requires, prefer: r.prefer, weight: r.weight, repo: r.repo, priority: r.priority, source: `routine:${r.name}`,
+      ...(pin ? { host: pin } : {}),
     });
-    const old = supersedeProposed(r.name, id); // a newer run replaces older unapproved copies
+    const old = supersedeProposed(r.name, id, pin); // a newer run replaces older unapproved copies
     if (old.length) journal(host, `⏰ routine \`${r.name}\`: ${id} supersedes ${old.join(", ")}`);
     state[r.name] = new Date().toISOString();
     journal(host, `⏰ routine \`${r.name}\` → ${id} (${r.agent})`);
@@ -185,13 +202,14 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   const ownerWork = meta.origin === "owner" || /^owner/.test(meta.source ?? "");
   const delegated = res.status === "delegated" && (res.followups?.length ?? 0) > 0;
   const children: string[] = [];
+  const chans = [...new Set([...(meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(res.channels)])].join(",") || undefined;
   for (const f of (res.followups ?? []).slice(0, depth > maxDepth ? 0 : 8)) {
     const id = newTask(f.title, f.body ?? "", { agent: f.agent ?? agent, priority: f.priority ?? meta.priority, repo: f.repo, requires: f.requires, host: f.host,
-      source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}) } });
+      source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}), ...(meta.origin_channel ? { origin_channel: meta.origin_channel } : {}), ...(chans ? { channels: resolveChannels(chans.split(",")).join(",") } : {}) } });
     children.push(id);
     journal(host, `  ↳ ${id} → ${f.agent ?? agent}: ${f.title}`);
   }
-  const done = { ...meta, cli_used: cli, finished: now(), status: res.status, gate_override: undefined, requeue_note: undefined, stalls: undefined };
+  const done = { ...meta, channels: chans, cli_used: cli, finished: now(), status: res.status, gate_override: undefined, requeue_note: undefined, stalls: undefined };
   const runNote = `\n\n## Run ${now()} · ${host} · ${cli}\n**${res.status}** — ${res.summary}\n`;
   // the owner added to the request while it ran: run again with the additions instead of reporting a stale result
   const latest = existsSync(path) ? readDoc(path).body : body;
@@ -212,8 +230,8 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     const w = waitMeta(res);
     const wakes = Number(meta.wakes ?? 0);
     // the owner's approval covers the whole task: a wait for CI before the approved merge must not revoke it
-    writeDoc(P("tasks", "waiting", `${meta.id}.md`), { ...done, gate_override: meta.gate_override, wake_at: w.wake_at, wait_kind: w.kind, wakes: wakes ? String(wakes) : undefined,
-      waiting_on: res.waiting_on ?? "", wait_check: res.wait_check || undefined },
+    writeDoc(P("tasks", "waiting", `${meta.id}.md`), { ...done, gate_override: meta.gate_override, waiting_since: meta.waiting_since || now(), wake_at: w.wake_at, wait_kind: w.kind, wakes: wakes ? String(wakes) : undefined,
+      waiting_on: res.waiting_on ?? "", wait_check: res.wait_check || undefined, wait_check_base: undefined },
       body + runNote + `\n**Waiting on:** ${res.waiting_on ?? "?"} (${w.kind === "human" ? "wakes on the owner's answer or an event" : `check again ${w.wake_at}`})\n`);
     journal(host, w.kind === "human" ? `⏳ ${meta.id} 等你处理：${res.waiting_on ?? ""}（不定时唤醒，事件到达再继续）` : `⏳ ${meta.id} 等待 ${res.waiting_on ?? ""}，${w.minutes} 分钟后再看`);
   } else if (res.status === "needs_decision") {
@@ -478,7 +496,7 @@ const runningIds = new Set<string>();
 const waitChecks = new Map<string, { cmd: string; base?: number; next: number; n: number }>();
 export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Set<string>> {
   const ready = new Set<string>();
-  const due: [string, string][] = [];
+  const due: [string, string, string][] = [];
   const waiting = new Set<string>();
   for (const p of list(P("tasks", "waiting"), /^T-.*\.md$/)) {
     const { meta } = readDoc(p);
@@ -486,10 +504,11 @@ export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Se
     waiting.add(meta.id);
     const c = waitChecks.get(meta.id);
     if (c && c.cmd === meta.wait_check && c.next > now) continue;
-    due.push([meta.id, meta.wait_check]);
+    due.push([meta.id, meta.wait_check, p]);
   }
-  await Promise.all(due.map(async ([id, cmd]) => {
-    const proc = Bun.spawn(["bash", "-lc", cmd], { stdout: "ignore", stderr: "ignore", cwd: homedir() });
+  await Promise.all(due.map(async ([id, cmd, path]) => {
+    // Non-login: the service already carries the user's PATH, and sourcing their profile can cost seconds (conda, etc.).
+    const proc = Bun.spawn(["bash", "-c", cmd], { stdout: "ignore", stderr: "ignore", cwd: homedir() });
     const timer = setTimeout(() => proc.kill(), 60_000);
     const code = await proc.exited;
     clearTimeout(timer);
@@ -497,7 +516,14 @@ export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Se
     const prev = waitChecks.get(id);
     const same = prev && prev.cmd === cmd;
     const n = same ? prev.n + 1 : 0;
-    const base = same ? prev.base : undefined;
+    // The baseline is persisted in the task, so a daemon restart can't make a wait that finished meanwhile its new baseline.
+    let base = same ? prev.base : undefined;
+    if (base === undefined) {
+      const doc = existsSync(path) ? readDoc(path) : undefined;
+      const saved = doc?.meta.wait_check_base?.match(/^(-?\d+) ([\s\S]*)$/);
+      if (saved && saved[2] === cmd) base = Number(saved[1]);
+      else if (doc) writeDoc(path, { ...doc.meta, wait_check_base: `${code} ${cmd}` }, doc.body);
+    }
     waitChecks.set(id, { cmd, base: base ?? code, next: now + (everyMs ?? backoffMinutes(n) * 60_000), n });
     if (base !== undefined && code !== base) { ready.add(id); waitChecks.delete(id); }
   }));
@@ -514,7 +540,7 @@ const inQuietHours = (cfg: Cfg) => {
   return a < b ? cur >= a && cur < b : cur >= a || cur < b;
 };
 
-function maybeProposeNext(cfg: Cfg, host: string, state: Record<string, string>) {
+export function maybeProposeNext(cfg: Cfg, host: string, state: Record<string, string>) {
   if (cfg.idle?.enabled === false || inQuietHours(cfg)) return;
   const busy = ["inbox", "active"].some((f) => list(P("tasks", f), /^T-.*\.md$/)
     .some((p) => !readDoc(p).meta.parked));
@@ -522,8 +548,10 @@ function maybeProposeNext(cfg: Cfg, host: string, state: Record<string, string>)
   state.idle_since ??= new Date().toISOString();
   const idleMin = (Date.now() - Date.parse(state.idle_since)) / 60_000;
   if (idleMin < (cfg.idle?.after_minutes ?? 20)) return;
-  // one menu at a time; re-offer after cooldown even if unanswered
-  const pendingMenu = list(P("decisions", "open")).map((p) => readDoc(p).meta).find((m) => m.kind === "menu");
+  // Re-offer after the latest unanswered menu's cooldown, regardless of filename order.
+  const pendingMenu = list(P("decisions", "open")).map((p) => readDoc(p).meta)
+    .filter((m) => m.kind === "menu")
+    .sort((a, b) => Date.parse(b.created) - Date.parse(a.created))[0];
   const cooldown = (cfg.idle?.cooldown_minutes ?? 180) * 60_000;
   if (pendingMenu && Date.now() - Date.parse(pendingMenu.created) < cooldown) return;
   if (state.last_menu && Date.now() - Date.parse(state.last_menu) < 15 * 60_000) return;
@@ -545,6 +573,16 @@ function pruneMediaHourly(cfg: Cfg) {
   } catch (e) { console.error(`media prune: ${e}`); }
 }
 
+/** Stall supervisor (T-0728): every [supervisor] every_minutes (30) chase waiting/blocked tasks like a team lead. */
+let lastSupervise = 0;
+function maybeSupervise(cfg: Cfg, host: string) {
+  if (cfg.supervisor?.enabled === false) return;
+  const every = (cfg.supervisor?.every_minutes ?? 30) * 60_000;
+  if (Date.now() - lastSupervise < every) return;
+  lastSupervise = Date.now();
+  try { supervise(cfg, host); } catch (e) { journal(host, `💥 supervisor: ${e}`); }
+}
+
 export async function tick(cfg: Cfg, background = false) {
   const host = hostName(cfg);
   const primary = isPrimary(cfg, host);
@@ -557,6 +595,7 @@ export async function tick(cfg: Cfg, background = false) {
       runRoutines(cfg, host, primary);
       reapStale(cfg, host);
       wakeParents(host, ready);
+      maybeSupervise(cfg, host);
       await proposeBatch(cfg, host);
       noteUnservable(cfg, host);
     } else reapStale(cfg, host, true);
@@ -620,12 +659,15 @@ async function planNow(cfg: Cfg, host: string) {
   const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned).slice(0, 12);
   if (!todo.length) return;
   const hosts = onlineHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
-  const r = await ask(`You place tasks for an AI agent fleet running on several machines.
+  const r = await quickAsk(`You place tasks for an AI agent fleet running on several machines.
 For each task decide:
+- channels: zero to three slugs from the channel goals below, or {"name":"...","goal":"..."} for a new work topic.
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
 - cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
 - difficulty: "hard" or "normal".
+
+${channelPrompt()}
 
 Online hosts:
 ${hosts || "(unknown)"}
@@ -633,7 +675,7 @@ ${hosts || "(unknown)"}
 Tasks:
 ${todo.map((t) => `- ${t.meta.id} [agent ${t.meta.agent}${t.meta.requires ? `, already requires ${t.meta.requires}` : ""}]: ${t.meta.title} — ${t.body.slice(0, 500).replace(/\s+/g, " ")}`).join("\n")}
 
-Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude", "difficulty": "normal"}, ...}`,
+Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude", "difficulty": "normal", "channels": []}, ...}`,
     cfg, P("logs", "runs", `plan-${Date.now()}.log`));
   if (!r || typeof r !== "object") return; // planner unavailable: tasks run unplanned after plan_wait_minutes
   await locked(async () => {
@@ -643,7 +685,8 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       if (!v || !existsSync(t.p)) continue;
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
-      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
+      const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
+      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
       journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
     }
@@ -735,8 +778,8 @@ async function daemon(cfg: Cfg) {
   }));
   // A new task from the owner's chat (created by the chat brain, or by create_task over MCP). It carries the channel's
   // recent conversation and the task it continues, so terse follow-ups ("不行，…", "这个细节记下来") keep their meaning.
-  let chatNow: { text: string; chat: string[]; reply?: string; thread?: boolean } | null = null; // the owner message the brain is handling
-  const createOwnerTask = (op: { title: string; details?: string; repo?: string; agent?: string; follows?: string }) => locked(async () => {
+  let chatNow: { text: string; chat: string[]; reply?: string; thread?: boolean; channel?: string } | null = null; // the owner message the brain is handling
+  const createOwnerTask = (op: { title: string; details?: string; repo?: string; agent?: string; follows?: string; channels?: unknown[] }) => locked(async () => {
     await _pull();
     const m = chatNow;
     const prev = op.follows ?? (m?.reply && !["inbox", "active", "waiting"].some((d) => existsSync(P("tasks", d, `${m.reply}.md`))) ? m.reply : undefined);
@@ -747,8 +790,10 @@ async function daemon(cfg: Cfg) {
         `\n## The channel just before this message\nThe owner writes tersely: words like "this", "不行", "这个细节", "以后都这样" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
       : "";
     const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("记录下来", "以后都这样"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
+    // said inside a channel: the task belongs to it and its results go back there
+    const assignedChannels = [...new Set([...(m?.channel ? [m.channel] : []), ...resolveChannels(op.channels)])].join(",");
     const id = newTask(op.title.slice(0, 80), `${asked}${op.details ? `\n## What the chat understood\n${op.details}\n` : ""}${op.repo ? `\nRepo: ${op.repo}\n` : ""}${context}${cont}\nHandle it like a capable chief of staff (see your profile: "Owner requests").`,
-      { agent: op.agent ?? "lead", source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
+      { agent: op.agent ?? "lead", source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(m?.channel ? { origin_channel: m.channel } : {}), ...(assignedChannels ? { channels: assignedChannels } : {}), ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
     journal(host, `💬 ${id} from owner ${m ? "chat" : "MCP"}${prevFile ? ` (follows ${prev})` : ""}: ${op.title.slice(0, 80)}`);
     await _commitPush(`[${host}] chat ${id}`);
     // plan it now and wake the loop, so an idle machine starts it within seconds instead of after the next tick or two
@@ -778,11 +823,12 @@ async function daemon(cfg: Cfg) {
   setApplyOp((op) => runTool(store, op?.tool, op));
   const model = new ClaudeModel(String(cfg.router?.model ?? "claude-haiku-5-5"), String(cfg.router?.cli ?? "claude"), (cfg.router?.timeout_seconds ?? 45) * 1000);
   if (isPrimary(cfg, host) && Bun.which(String(cfg.router?.cli ?? "claude"))) model.warm(SYSTEM);
-  if (isPrimary(cfg, host)) startServer(cfg, async (text, { reply, answered, sentAt, thread }) => {
+  if (isPrimary(cfg, host)) startServer(cfg, async (text, { reply, answered, sentAt, thread, channel }) => {
     const got = Date.now();
-    const m = { text, replyTo: reply, answered, chat: recentChat(text), sentAt };
-    chatNow = { text, chat: m.chat, reply, thread };
-    const post = (r: string, ref?: string) => appendEvent({ from: "hub", kind: "system", text: r.slice(0, 2000), ...(ref ? { ref } : {}), ...(thread ? { thread } : {}) });
+    const room = channel ? channels().find((c) => c.slug === channel) : undefined;
+    const m = { text, replyTo: reply, answered, chat: recentChat(text, { channel }), sentAt, ...(room ? { channel: { slug: room.slug, name: room.name, goal: room.goal } } : {}) };
+    chatNow = { text, chat: m.chat, reply, thread, channel: room?.slug };
+    const post = (r: string, ref?: string) => appendEvent({ from: "hub", kind: "system", text: r.slice(0, 2000), ...(ref ? { ref } : {}), ...(thread ? { thread } : {}), ...(room ? { channel: room.slug } : {}) });
     let out: BrainOut;
     try {
       out = await think(m, store, model, post);
@@ -790,7 +836,9 @@ async function daemon(cfg: Cfg) {
     } catch (err) {
       // no model (CLI missing, logged out, timeout): the message still becomes work, silently — never lost, never canned
       console.error(`chat brain: ${err}`);
-      const amended = reply ? await store.act({ tool: "amend_task", id: reply, text }) : null;
+      // a terse follow-up without a reply target continues the task the channel was just about
+      const target = reply ?? followUpTarget(text, feed(new Date(Date.now() - 15 * 60_000).toISOString(), 200));
+      const amended = target ? await store.act({ tool: "amend_task", id: target, text }) : null;
       const r = amended?.ok ? amended : await store.act({ tool: "create_task", title: text.split("\n")[0].slice(0, 80) });
       out = { reply: "", calls: [{ tool: "fallback", args: {}, ok: !!r.ok, result: r }], rounds: 0, ms: { model: [], total: Date.now() - got }, fallback: true };
     } finally { chatNow = null; }
@@ -841,7 +889,8 @@ async function daemon(cfg: Cfg) {
 
 async function status(cfg: Cfg, brief = false) {
   if (brief) { // what a person wants to see right after installing
-    const url = cfg.cloud?.url;
+    const url = readHubToml().cloud?.url ?? cfg.cloud?.url;
+    if (!url) return void console.log(`  ✗ ${hostName(cfg)} is not connected to your Noop yet. Run: noop init <noop-url>`);
     const hosts = onlineHosts(cfg).map((h) => h.host);
     console.log(`  ✓ ${hostName(cfg)} is part of your team${hosts.length > 1 ? ` (${hosts.length} machines online)` : ""}`);
     if (url) console.log(`\n  Open ${url}\n  and sign in with the code sent to your email.`);
@@ -894,8 +943,12 @@ const HELP = `Noop — your own AI team
   noop status                 queue / decision / accounts / resources overview
   noop learn [--full] [--dry]  learn the CEO from local Claude/Codex sessions (digest stays local; principles go to memory)
   noop metrics [days]         per-agent success, judge vs owner decisions (feeds self-evolution)
+  noop usage                  weekly usage report (also posted every Monday by the built-in routine)
   noop agents                 list fleet members
   noop notify "text"          test Slack/Discord
+  noop security [--json]      check this Noop deployment (2FA, sessions, OAuth clients, allow-lists) and this machine's Noop setup
+  noop 2fa setup              bind (or re-bind) the authenticator app every sign-in requires; noop 2fa confirm <code> · noop 2fa status
+  noop revoke-sessions        security valve: sign out every phone, browser and MCP connector at once (machines keep working)
 `;
 
 async function main() {
@@ -965,6 +1018,7 @@ async function main() {
       await commitPush(`[${host}] learn ${id}`);
       return console.log(id);
     }
+    case "usage": return void console.log(writeUsageReport().markdown);
     case "metrics": return void console.log(JSON.stringify(computeMetrics(Number(rest[0] ?? 7)), null, 2));
     case "agents":
       for (const p of list(P("agents"), /.*/)) {
@@ -978,6 +1032,61 @@ async function main() {
       if (!r?.ok) return void console.log("没有待使用的验证码：先在 app 里输入邮箱，点「发送验证码」，再运行 noop login");
       const c = (await r.json()) as { email: string; code: string; expires: number };
       return void console.log(`\n  ${c.email} 的验证码：${c.code}  （${Math.max(1, Math.round((c.expires - Date.now()) / 60000))} 分钟内有效）\n`);
+    }
+    case "security": {
+      const { securityReport, formatReport } = await import("./security");
+      const items = await securityReport(cfg, host, isPrimary(cfg, host));
+      console.log(rest.includes("--json") ? JSON.stringify({ host, items }, null, 2) : formatReport(host, items));
+      if (items.some((i) => i.level === "bad")) process.exitCode = 1;
+      return;
+    }
+    case "2fa": { // the mandatory second factor; bound from a machine only (the machine key is the root of trust)
+      const url = String(cfg.cloud?.url ?? "").replace(/\/$/, "");
+      if (!url) return void console.log("没有配置 [cloud] url");
+      const call = (path: string, body?: unknown) => fetch(`${url}${path}`, { method: body === undefined ? "GET" : "POST",
+        headers: { Authorization: `Bearer ${cfg.server?.token}`, "x-noop-host": host, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      if (rest[0] === "status" || !rest[0]) {
+        const r = await call("/api/host/2fa");
+        if (!r.ok) { process.exitCode = 1; return void console.log(`查询失败：HTTP ${r.status} ${await r.text()}`); }
+        const d = (await r.json()) as { bound: boolean; since: number | null };
+        return void console.log(d.bound ? `✓ 两步验证已绑定（${new Date(d.since ?? 0).toLocaleString()}）` : "✗ 还没有绑定两步验证：任何人都无法登录。运行 noop 2fa setup");
+      }
+      if (rest[0] === "confirm") { // the second half of setup when it can't prompt (no terminal)
+        const c = await call("/api/host/2fa/confirm", { totp: String(rest[1] ?? "").trim() });
+        const d = (await c.json().catch(() => ({}))) as { error?: string; replaced?: boolean };
+        if (!c.ok) { process.exitCode = 1; return void console.log(`✗ ${d.error ?? `HTTP ${c.status}`}`); }
+        return void console.log(d.replaced ? "✓ 已换绑，旧的验证器已失效。" : "✓ 两步验证已开启：以后登录需要邮箱验证码 + 验证器上的数字。");
+      }
+      if (rest[0] !== "setup") return void console.log("usage: noop 2fa setup | noop 2fa confirm <6 位数字> | noop 2fa status");
+      const st = (await (await call("/api/host/2fa")).json().catch(() => ({}))) as { bound?: boolean };
+      if (st.bound) console.log("⚠ 已经绑定过：确认后旧的验证器立即失效。");
+      const r = await call("/api/host/2fa/setup", {});
+      if (!r.ok) { process.exitCode = 1; return void console.log(`失败：HTTP ${r.status} ${await r.text()}`); }
+      const { secret, uri } = (await r.json()) as { secret: string; uri: string };
+      console.log("\n用验证器 App（Google Authenticator / 1Password / Authy …）扫描二维码：\n");
+      const qr = Bun.which("qrencode") ? await $`qrencode -t ansiutf8 -m 2 ${uri}`.quiet().nothrow() : null;
+      if (qr?.exitCode === 0) console.log(qr.stdout.toString());
+      else console.log("（装了 qrencode 就能在这里显示二维码）");
+      console.log(`扫不了就手动输入密钥：${secret.match(/.{1,4}/g)!.join(" ")}\n`);
+      if (!process.stdin.isTTY) return void console.log("扫码后 10 分钟内运行：noop 2fa confirm <验证器上的 6 位数字>");
+      for (let i = 0; i < 3; i++) {
+        const code = (prompt("输入验证器 App 上的 6 位数字确认：") ?? "").trim();
+        if (!code) break;
+        const c = await call("/api/host/2fa/confirm", { totp: code });
+        const d = (await c.json().catch(() => ({}))) as { ok?: boolean; error?: string; replaced?: boolean };
+        if (c.ok) return void console.log(d.replaced ? "✓ 已换绑，旧的验证器已失效。" : "✓ 两步验证已开启：以后登录需要邮箱验证码 + 验证器上的数字。");
+        console.log(`✗ ${d.error ?? `HTTP ${c.status}`}`);
+      }
+      process.exitCode = 1;
+      return void console.log("没有确认，绑定未生效。");
+    }
+    case "revoke-sessions": { // a sign-in alert you didn't expect: everyone but the machines is out
+      const url = String(cfg.cloud?.url ?? "").replace(/\/$/, "");
+      if (!url) return void console.log("没有配置 [cloud] url");
+      const r = await fetch(`${url}/api/host/revoke-sessions`, { method: "POST", headers: { Authorization: `Bearer ${cfg.server?.token}`, "x-noop-host": host } }).catch((e) => e as Error);
+      if (r instanceof Error || !r.ok) { process.exitCode = 1; return void console.log(`撤销失败：${r instanceof Error ? r.message : `HTTP ${r.status} ${await r.text()}`}`); }
+      const { revoked } = (await r.json()) as { revoked: number };
+      return void console.log(`✓ 已撤销 ${revoked} 个登录（手机、浏览器、MCP 连接器）。需要重新用邮箱验证码登录。\n  如果怀疑邮箱被盗，先改邮箱密码，再考虑轮换机器密钥。`);
     }
     case "cloud": {
       if (rest[0] !== "deploy") return void console.log("usage: hub cloud deploy");

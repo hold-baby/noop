@@ -7,7 +7,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { type Jwk, newVapidKeys } from "../cloud/src/push";
+import { ipAllowed, parseAllowList } from "../cloud/src/ipallow";
 import { type Cfg, CODE, P, _commitPush, _pull, hostName, journal, locked, HOME_DIR } from "./core";
+import { updateChannel } from "./channels";
 import { writeHubToml } from "./sync";
 import { ensureWebClient } from "./webclient";
 import { type Event, MEDIA, appendEvent, applyOp, handleOwnerMessage, saveSettings, setMirror, settingsView, status, cancelTask, updateFleet } from "./server";
@@ -97,11 +99,13 @@ export function startCloudBridge(cfg: Cfg) {
       after = it.seq; saveCursor(); // before handling, so a restart mid-message doesn't replay it
       if (!fresh) return;
       appendEvent(e, { mirror: false }); // keep the local record (learning reads it); the cloud already has it
-      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread });
+      await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread, channel: e.channel });
     } else if (it.type === "op" && it.op) {
       await applyOp(it.op);
     } else if (it.type === "cancel" && typeof it.id === "string") {
       await cancelTask(it.id, it.done === true);
+    } else if (it.type === "channel" && typeof it.slug === "string") {
+      await locked(async () => { if (typeof updateChannel(it.slug, it) !== "string") await _commitPush(`channel ${it.slug}`); });
     } else if (it.type === "update") {
       await updateFleet();
     } else if (it.type === "settings") {
@@ -166,6 +170,15 @@ async function vapidKeys(): Promise<{ publicKey: string; privateJwk: Jwk }> {
   return k;
 }
 
+/** [cloud] allow_ips (a string or a list of IPs / CIDRs) → the HUB_ALLOW_IPS secret ("" = no IP restriction).
+ *  undefined when config.toml has no allow_ips at all: a deploy then leaves the Worker's list as it is, so a machine
+ *  whose config is behind (not synced yet) cannot switch the allow-list off by redeploying. */
+export function allowIps(cfg: Cfg): string | undefined {
+  if (!cfg.cloud || !("allow_ips" in cfg.cloud)) return undefined;
+  const v = cfg.cloud?.allow_ips;
+  return (Array.isArray(v) ? v.map(String) : String(v ?? "").split(/[\s,]+/)).map((x) => x.trim()).filter(Boolean).join(",");
+}
+
 /** Why the last cloudDeploy returned false (for the journal: a daemon's console is out of the owner's sight). */
 export let lastDeployError = "";
 
@@ -185,14 +198,37 @@ export async function cloudDeploy(cfg: Cfg) {
   if (!cfg.server?.token) return fail("缺少 [server] token，先运行 hub init");
   if (!(await ensureWebClient())) return fail("客户端网页下载失败，Worker 没有部署。请检查网络后重新运行：noop cloud deploy");
   const name = cfg.cloud?.name ?? "noop";
+  // IP allow-list: refuse a list that doesn't parse, or that would shut out the very machine deploying it
+  const allow = allowIps(cfg);
+  if (allow) {
+    const { nets, bad } = parseAllowList(allow);
+    if (bad.length) return fail(`[cloud] allow_ips 里有无法识别的项：${bad.join(" ")}`);
+    const prev = String(cfg.cloud?.domain ? `https://${cfg.cloud.domain}` : cfg.cloud?.url ?? "").replace(/\/$/, "");
+    const mine = prev ? (await fetch(`${prev}/cdn-cgi/trace`).then((r) => r.text()).catch(() => "")).match(/^ip=(.+)$/m)?.[1]?.trim() : undefined;
+    if (mine && !ipAllowed(mine, nets)) return fail(`本机出口 IP ${mine} 不在 [cloud] allow_ips 里：部署后这台机器会连不上 Worker。先把它加进去再部署。`);
+  }
   console.log(`部署到你的 Cloudflare 账号（Worker：${name}）…`);
   // [cloud] domain (e.g. noop.example.com on a zone in the same account) attaches a Custom Domain and becomes the URL
   const domain = String(cfg.cloud?.domain ?? "").trim();
-  const dep = await $`${wr} deploy --name ${name} ${domain ? ["--domain", domain] : []}`.cwd(dir).env(env).quiet().nothrow();
-  const out = dep.stdout.toString() + dep.stderr.toString();
+  const deploy = () => $`${wr} deploy --name ${name} ${domain ? ["--domain", domain] : []}`.cwd(dir).env(env).quiet().nothrow();
+  let dep = await deploy();
+  let out = dep.stdout.toString() + dep.stderr.toString();
+  // a brand-new Cloudflare account has no workers.dev subdomain yet, and wrangler can only ask for one with a
+  // terminal in front of it — we run it quietly, so on that first deploy hand the user's terminal over for that
+  // one-time question, then deploy quietly again to capture the URL (a custom domain never needs workers.dev)
+  if (dep.exitCode !== 0 && !domain && /register a workers\.dev subdomain/i.test(out)) {
+    const link = out.match(/https:\/\/dash\.cloudflare\.com\/\S+\/workers\/onboarding/)?.[0];
+    if (!process.stdin.isTTY)
+      return fail(`这个 Cloudflare 账号还没有 workers.dev 子域名（账号第一次部署 Worker 都要先注册一个）。\n注册入口：${link ?? "Cloudflare 控制台 → Workers & Pages"}\n或在 cloud/ 目录交互式运行一次 bunx wrangler deploy，按提示注册。\n然后重新运行：hub cloud deploy`);
+    console.log("账号还没有 workers.dev 子域名：按 wrangler 接下来的提示注册一个（一次性，之后这个账号的 Worker 都用它做前缀）…");
+    const ask = Bun.spawn([...wr, "deploy", "--name", name], { cwd: dir, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    if ((await ask.exited) !== 0) return fail("workers.dev 子域名没有注册成；注册好之后重新运行：hub cloud deploy");
+    dep = await deploy();
+    out = dep.stdout.toString() + dep.stderr.toString();
+  }
   if (dep.exitCode !== 0) return fail(out.slice(-1500));
   const url = domain ? `https://${domain}` : out.match(/https:\/\/[\w.-]+\.workers\.dev/)?.[0];
-  const secrets: Record<string, string> = { HUB_TOKEN: cfg.server.token };
+  const secrets: Record<string, string> = { HUB_TOKEN: cfg.server.token, ...(allow !== undefined ? { HUB_ALLOW_IPS: allow } : {}) };
   const e = cfg.email ?? {};
   if (e.to && e.host) {
     secrets.HUB_OWNER_EMAIL = String(e.to);
@@ -215,7 +251,7 @@ export async function cloudDeploy(cfg: Cfg) {
     const f = P("config.toml");
     let s = readFileSync(f, "utf8");
     // keep the account too: without it the primary's next redeploy (on every update) may land in another account
-    const block = `[cloud]\nurl = "${url}"\nname = "${name}"\n${account ? `account = "${account}"\n` : ""}${domain ? `domain = "${domain}"\n` : ""}`;
+    const block = `[cloud]\nurl = "${url}"\nname = "${name}"\n${account ? `account = "${account}"\n` : ""}${domain ? `domain = "${domain}"\n` : ""}${allow !== undefined ? `allow_ips = "${allow}"\n` : ""}`;
     s = /^\[cloud\]/m.test(s) ? s.replace(/^\[cloud\][^\[]*/m, `${block}\n`) : `${s.trimEnd()}\n\n${block}`;
     writeFileSync(f, s);
     writeFileSync(P("README.md"), `# noop data\n\n私有数据（保存在你自己的 Cloudflare Worker 里）：任务、决策、记忆、日志。\n\n## 客户端\n\n地址：**${url}**\n\n打开后粘贴 token 连接（或用邮箱验证码登录；机器 token 在主机的 ~/.noop/noop.toml 里）。这个地址部署在你自己的 Cloudflare 账号里，固定不变。\n`);

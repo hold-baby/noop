@@ -8,6 +8,7 @@
 // owner messages reach this daemon over the existing owner→fleet inbox (long-polled, so within milliseconds), and the
 // reply goes back as a normal feed event.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { channelPrompt } from "./channels";
 import { join, relative } from "node:path";
 import { DATA, HOME_DIR, P, _commitPush, _pull, journal, locked, now, readDoc, writeDoc } from "./core";
 import { type Ev, type FileRow, type ToolStore, type WriteOp, isWrite, listDecisions, listRoutines, listTasks, editMemoryEntry, runTool, toolsFor, writeOp } from "../cloud/src/tools";
@@ -116,7 +117,7 @@ export class ClaudeModel implements Model {
     mkdirSync(BRAIN_DIR, { recursive: true });
     const proc = Bun.spawn([this.cli, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
       "--model", this.model, "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
-      "--no-session-persistence", "--system-prompt", system], { cwd: BRAIN_DIR, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+      "--no-session-persistence", "--system-prompt", system], { cwd: BRAIN_DIR, stdin: "pipe", stdout: "pipe", stderr: "ignore", env: { ...process.env, ...userSettingsEnv() } });
     return { proc, system };
   }
   /** Spawn the next process now (the daemon calls this at start), so the first message is fast too. */
@@ -213,6 +214,8 @@ export type BrainIn = {
   chat?: string[];
   /** When the owner sent it (feed ts), for latency. */
   sentAt?: string;
+  /** Said inside a channel: the discussion and the work it starts stay there. */
+  channel?: { slug: string; name: string; goal: string };
 };
 export type BrainOut = { reply: string; calls: { tool: string; args: any; ok: boolean; result?: any; error?: string }[]; rounds: number; ms: { first_reply?: number; model: number[]; total: number }; fallback?: boolean };
 
@@ -229,6 +232,8 @@ export function context(st: ToolStore, m: BrainIn): string {
   const s = st.status() ?? {};
   return [
     `Now: ${new Date().toISOString()}`,
+    channelPrompt(),
+    "When calling create_task, set channels by these goals. Existing slugs or {name, goal} for a new work topic; [] for none.",
     `Routines: ${listRoutines(st).map((r) => `${r.name} (${r.every ?? r.at ?? "?"}, ${r.agent}${r.enabled ? "" : ", off"})`).join("; ") || "(none)"}`,
     `Machines online: ${(s.hosts ?? []).filter((h: any) => h.online !== false).map((h: any) => h.host).join(", ") || "unknown"}`,
     `Open tasks:\n${open.map((t) => `- ${t.id} [${t.state}${t.agent ? `, ${t.agent}` : ""}${t.host ? ` on ${t.host}` : ""}${t.priority ? `, ${t.priority}` : ""}] ${t.title}`).join("\n") || "(none)"}`,
@@ -238,6 +243,7 @@ export function context(st: ToolStore, m: BrainIn): string {
     mem.length ? `Memory lines that may be relevant (read_memory for more):\n${mem.join("\n")}` : "",
     ids.length ? `Tasks mentioned in the channel: ${ids.join(", ")}` : "",
     `The channel just before (oldest first):\n${(m.chat ?? []).join("\n") || "(empty)"}`,
+    m.channel ? `The owner wrote this inside the channel #${m.channel.name} (\`${m.channel.slug}\`), goal: ${m.channel.goal || "(none)"}. Read it in that context; the conversation above is this channel's. Your reply and any task you create belong to this channel (it is added to the task's channels automatically).` : "",
     m.replyTo ? `The owner wrote this as a reply to the team's message about ${m.replyTo}.` : "",
     `The owner's message:\n${m.text.slice(0, 4000)}`,
   ].filter(Boolean).join("\n\n");
@@ -309,6 +315,15 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
 }
 
 /** Latency log (one JSON line per message): ~/.noop/brain.jsonl, local to this machine. */
+/** Without the model: the task a terse follow-up continues. A short one-line message sent within 10 minutes of the team's
+ *  last message about a task ("应该转发…", "给我中文") belongs to that task's conversation, not to a new task. */
+export function followUpTarget(text: string, events: { from: string; ts: string; ref?: string }[], now = Date.now()): string | undefined {
+  const t = text.trim();
+  if (!t || t.includes("\n") || [...t].length > 40) return undefined;
+  const last = [...events].reverse().find((e) => e.from !== "owner" && /^T-\w+$/.test(e.ref ?? ""));
+  return last && now - Date.parse(last.ts) <= 10 * 60_000 ? last.ref : undefined;
+}
+
 export function logBrain(m: BrainIn, out: BrainOut, receivedAt: number) {
   try {
     mkdirSync(HOME_DIR, { recursive: true });
@@ -322,4 +337,15 @@ export function logBrain(m: BrainIn, out: BrainOut, receivedAt: number) {
       calls: out.calls.map((c) => ({ tool: c.tool, ok: c.ok, ...(c.error ? { error: c.error } : {}) })),
     }) + "\n");
   } catch {}
+}
+
+/** `--setting-sources ""` also drops the `env` block of ~/.claude/settings.json, where an API gateway
+ *  (ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY) is configured; without it the brain falls back to the OAuth login
+ *  and fails with "Not logged in" while every task run works. Pass that env through explicitly. */
+export function userSettingsEnv(path = `${process.env.CLAUDE_CONFIG_DIR ?? `${process.env.HOME}/.claude`}/settings.json`): Record<string, string> {
+  try {
+    const env = JSON.parse(readFileSync(path, "utf8"))?.env;
+    if (!env || typeof env !== "object") return {};
+    return Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === "string")) as Record<string, string>;
+  } catch { return {}; }
 }

@@ -1,11 +1,12 @@
 // Builds the prompt for an agent, runs Claude Code / Codex headless, parses the structured result.
-import { existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
 import { claudeDisallowed } from "./gates";
+import { channelPrompt } from "./channels";
 
 export type Result = {
   status: "done" | "needs_decision" | "failed" | "delegated" | "waiting";
@@ -19,6 +20,7 @@ export type Result = {
   recommendation?: string;
   lessons?: string[];
   attachments?: string[];
+  channels?: unknown[];
   followups?: { title: string; body?: string; agent?: string; priority?: string; repo?: string; requires?: string; host?: string }[];
 };
 
@@ -34,7 +36,8 @@ const RESULT_SPEC = `Finish the work, then end your final reply with EXACTLY one
   "options": ["A: <recommended> — consequence", "B: ... — consequence"],
   "recommendation": "A",
   "lessons": ["durable lesson for your own memory (optional)"],
-  "attachments": ["/abs/path/screenshot.png", "/abs/path/recording.mp4"],   // optional: shown to the owner with the message
+  "attachments": ["/abs/path/screenshot.png", "/abs/path/recording.mp4", "/abs/path/report.md"],   // optional: shown to the owner with the message; a long report goes as a .md file the owner opens in the chat, never as "see file"
+  "channels": ["existing-slug", {"name": "New topic", "goal": "what it is for"}],   // see # Channels; [] when none fits
   "followups": [{"title": "...", "body": "...", "agent": "<agent id>", "priority": "normal", "difficulty": "hard if it needs deep engineering/design work", "requires": "os:macos when it needs macOS/iOS/Xcode (os:windows for Windows); omit otherwise"}]
 }
 Write summary, question and options in the owner's language (Simplified Chinese unless the owner writes otherwise), plain text, no emoji; keep identifiers, links and code as they are.
@@ -79,6 +82,8 @@ Outside the hub you are Noop: never use your agent name (${agentName(agent)}) or
 
 # Resource budget
 ${resourceNote}
+
+${channelPrompt()}
 
 # Task ${meta.id}: ${meta.title}
 Working directory: ${meta.repo || ROOT}   Scratch space (checkouts, worktrees, build targets): ~/.agent-hub/work — never inside the hub folder ${ROOT}, which syncs to the cloud   Host capabilities: ${meta.host_caps ?? ""}
@@ -128,6 +133,15 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
   throw new Error(`unknown cli ${cli}`);
 }
 
+/** The model a CLI is started with: an explicit `--model`/`-m`, else Codex's own config default. */
+export function startModel(cli: string, cmd: string[], codexHome?: string): string | undefined {
+  codexHome ??= process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  const i = cmd.findIndex((c) => c === "--model" || c === "-m");
+  if (i >= 0 && cmd[i + 1]) return cmd[i + 1];
+  if (cli === "codex") return readIf(join(codexHome, "config.toml"), 100000).match(/^\s*model\s*=\s*"([^"]+)"/m)?.[1];
+  return undefined;
+}
+
 /** Running agent processes by task id (so the owner can cancel one). */
 export const agentProcs = new Map<string, { kill: (sig?: number | NodeJS.Signals) => void }>();
 
@@ -141,8 +155,9 @@ function toolStep(name: string, input: any): string {
 /** Marker runAgent appends when it stopped a run that went quiet (see stall_minutes). */
 export const STALLED = "\n[stalled]";
 
+/** `retryEmpty` is internal: an empty completion gets exactly one rerun (see the end of the function). */
 export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cfg, logFile: string, gateOverride = false,
-  extraEnv: Record<string, string> = {}): Promise<string> {
+  extraEnv: Record<string, string> = {}, retryEmpty = true): Promise<string> {
   const cmd = cliCommand(cli, cfg, gateOverride);
   const timeoutMs = (cfg.clis?.timeout_minutes ?? 60) * 60_000;
   const stallMs = (cfg.clis?.stall_minutes ?? 20) * 60_000;
@@ -158,18 +173,20 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
 
   // what the agent is doing: every chunk of output is a sign of life; Claude's stream also names each step
   const json = cmd.includes("stream-json");
-  const act = { at: Date.now(), step: undefined as string | undefined, steps: 0 };
+  const act = { at: Date.now(), step: undefined as string | undefined, steps: 0, model: startModel(cli, cmd, extraEnv.CODEX_HOME) };
   const inFlight = new Map<string, string>(); // tool_use id → tool name, until its result comes back
   let resultText: string | undefined, assistantText = "";
   const touch = () => {
     act.at = Date.now();
-    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: act.step, steps: act.steps });
+    if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: act.step, steps: act.steps, model: act.model });
   };
   touch();
   const onLine = (line: string) => {
     let e: any;
     try { e = JSON.parse(line); } catch { return; }
+    if (e.type === "system" && e.subtype === "init" && e.model) act.model = String(e.model);
     if (e.type === "assistant") {
+      if (e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
       for (const c of e.message?.content ?? []) {
         if (c.type === "tool_use") { inFlight.set(c.id, c.name); act.step = toolStep(c.name, c.input); act.steps++; }
         else if (c.type === "text" && !e.parent_tool_use_id) assistantText += c.text;
@@ -219,6 +236,18 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const out = json ? (resultText ?? assistantText) : raw;
   if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${act.step ? `; last step: ${act.step}` : ""}; run long builds in the background and return "waiting"`;
   if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${act.step ? `; last step: ${act.step}` : ""}`;
+  // A provider occasionally answers with an empty completion (no text, no tool call, exit 0) and Claude Code's own
+  // "no visible output" retry gets nothing either. That is a flake of the tool chain, not the task failing: rerun the
+  // same prompt once, and never hand the empty run back to the caller as the task's result.
+  // Do not retry when the run already used a tool or printed visible assistant text: an empty final result can still
+  // sit on top of side effects (a posted comment, a commit), and replaying the prompt would repeat them. `out` is only
+  // the final/assistant text, so also require act.steps === 0 and no accumulated assistantText.
+  if (retryEmpty && !out.trim() && !code && !act.steps && !assistantText.trim()) {
+    const first = readFileSync(logFile, "utf8");
+    const again = await runAgent(cli, prompt, cwd, cfg, logFile, gateOverride, extraEnv, false);
+    writeFileSync(logFile, `${first}\n\n[retried after an empty response]\n${readFileSync(logFile, "utf8")}`); // keep both attempts
+    return again;
+  }
   return out + (code ? `\n[exit ${code}] ${err.slice(-2000)}` : "");
 }
 

@@ -39,18 +39,18 @@ test('screenshot loads at its declared size', async ({ page }) => {
   await page.goto('./');
   const image = page.locator('.app-screenshot img');
   await image.scrollIntoViewIfNeeded();
-  await expect.poll(() => image.evaluate((element: HTMLImageElement) => [element.naturalWidth, element.naturalHeight])).toEqual([2000, 1385]);
+  await expect.poll(() => image.evaluate((element: HTMLImageElement) => [element.naturalWidth, element.naturalHeight])).toEqual([2000, 1390]);
 });
 
 test('gallery images load and link to full size', async ({ page }) => {
   await page.goto('./');
   const images = page.locator('.gallery img');
-  await expect(images).toHaveCount(3);
+  await expect(images).toHaveCount(5);
   for (const image of await images.all()) {
     await image.scrollIntoViewIfNeeded();
     await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(2000);
   }
-  await expect(page.locator('.gallery a').first()).toHaveAttribute('href', '/noop/screenshot-machine.png');
+  await expect(page.locator('.gallery a').first()).toHaveAttribute('href', '/noop/screenshot-task.png');
 });
 
 test('related projects link to the other projects in both languages', async ({ page }) => {
@@ -119,8 +119,8 @@ test('tabs switch with mouse and keyboard and copy the chosen command', async ({
   await page.getByRole('tab', { name: 'More machines', exact: true }).focus();
   await page.keyboard.press('End');
   await expect(client).toBeFocused();
-  await expect(page.getByRole('tabpanel').getByRole('link', { name: /Android/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/Noop-android.apk');
-  await expect(page.getByRole('tabpanel').getByRole('link', { name: /iOS/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/Noop-ios-unsigned.ipa');
+  await expect(page.getByRole('tabpanel').getByRole('link', { name: /Android/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/noop-android.apk');
+  await expect(page.getByRole('tabpanel').getByRole('link', { name: /iOS/ })).toHaveAttribute('href', 'https://github.com/huacnlee/noop/releases/latest/download/noop-ios-unsigned.ipa');
   await page.locator('[data-copy="command-client-0"]').click();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(`curl -fsSL ${site}/install-client.sh | bash`);
   await page.keyboard.press('Tab');

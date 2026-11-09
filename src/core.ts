@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFile
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as sync from "./sync";
+import { BUILTIN_ROUTINES } from "./builtin-routines";
 
 /** Framework code (this repo, self-updating). */
 export const CODE = resolve(import.meta.dir, "..");
@@ -37,6 +38,13 @@ export function loadConfig(): Cfg {
   // settings.json = changes made from the UI (shared via the data repo), applied over config.toml; config.local.toml wins last
   const ui = existsSync(P("settings.json")) ? JSON.parse(readFileSync(P("settings.json"), "utf8")) : {};
   const cfg: Cfg = merge(merge(merge(sync.readHubToml(), read("config.toml")), ui), read("config.local.toml"));
+  // built-in routines (src/builtin-routines.ts) unless config.toml defines one of the same name
+  cfg.routine = Array.isArray(cfg.routine) ? cfg.routine : [];
+  for (const b of BUILTIN_ROUTINES) if (!cfg.routine.some((r: any) => r.name === b.name)) {
+    const r: Record<string, unknown> = { ...b, builtin: true };
+    if (r.agent && !existsSync(P("agents", String(r.agent)))) r.agent = "lead"; // a fleet without that member
+    cfg.routine.push(r);
+  }
   // routine tweaks from the UI: { routines: { <name>: { enabled, every } } }
   for (const r of cfg.routine ?? []) Object.assign(r, ui.routines?.[r.name] ?? {});
   cfg.notify ??= {};
@@ -226,7 +234,8 @@ export type HostBeat = { host: string; caps: string[]; seen: string; busy: numbe
   /** Per running task: when its agent last showed a sign of life and what it was doing. */ activity?: Record<string, Activity> };
 
 /** A running agent's latest sign of life: any output; for Claude also the step it took ("Bash · gh pr checks 814"). */
-export type Activity = { at: string; step?: string; steps: number };
+export type Activity = { at: string; step?: string; steps: number;
+  /** The model actually answering (Claude reports it in its stream; Codex: the one it was started with). */ model?: string };
 /** This process's running agents (written by runAgent, published in the heartbeat). */
 export const agentActivity = new Map<string, Activity>();
 

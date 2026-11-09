@@ -4,7 +4,7 @@ Your own AI team, so your day can be a no-op.
 
 [Website](https://huacnlee.github.io/noop/) · [Download the app](https://github.com/huacnlee/noop/releases) · [Install](#install)
 
-<img width="2000" height="1385" alt="The Noop app: a team channel with agent updates and a decision card" src="website/public/screenshot.png" />
+<img width="2000" height="1390" alt="The Noop app: the team channel with agent updates, beside lists of tasks" src="website/public/screenshot.png" />
 
 Noop runs a small team of Claude Code and Codex agents on your own computers. They do your daily work, decide what they can based on how you've decided before, and only ask you when something really needs you — with a short list of options you answer in one tap.
 
@@ -53,8 +53,8 @@ irm https://huacnlee.github.io/noop/install-client.ps1 | iex
 
 From v0.1.5 the desktop apps update themselves: when a new version has downloaded, the sidebar offers a restart. Earlier versions update by running the same command again.
 
-- **Android** (9+): download [Noop-android.apk](https://github.com/huacnlee/noop/releases/latest/download/Noop-android.apk) on your phone and open it.
-- **iOS** (15+): [Noop-ios-unsigned.ipa](https://github.com/huacnlee/noop/releases/latest/download/Noop-ios-unsigned.ipa) is not signed, so sign and install it with your own Apple ID using a tool such as Sideloadly or AltStore.
+- **Android** (9+): download [noop-android.apk](https://github.com/huacnlee/noop/releases/latest/download/noop-android.apk) on your phone and open it.
+- **iOS** (15+): [noop-ios-unsigned.ipa](https://github.com/huacnlee/noop/releases/latest/download/noop-ios-unsigned.ipa) is not signed, so sign and install it with your own Apple ID using a tool such as Sideloadly or AltStore.
 
 ## Use
 

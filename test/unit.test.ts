@@ -212,3 +212,12 @@ test("a reply to an agent's message goes to the brain with that task, never as a
   expect(calls.at(-1)).toEqual(["等等，选 B", { reply: undefined, answered: "D-0001" }]);
   expect(drainInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
 });
+
+test("transient Claude 403 is retried later, not a lost task", async () => {
+  const { classify } = await import("../src/accounts");
+  // seen 14× on 2 Macs (2026-11-05..09): ends the run with no result block, clears up on its own without a re-login
+  expect(classify("Failed to authenticate. API Error: 403 Request not allowed\n[exit 1]")).toBe("quota");
+  expect(classify("API Error: 403 {\"error\":{\"message\":\"Request not allowed\"}}")).toBe("quota");
+  expect(classify("Invalid API key · Please run /login")).toBe("auth");
+  expect(classify("HTTP 403 while fetching https://github.com/x")).toBeNull();
+});

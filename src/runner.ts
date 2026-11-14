@@ -195,7 +195,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
 
   // what the agent is doing: every chunk of output is a sign of life; Claude's stream also names each step
   const json = cmd.includes("stream-json");
-  const act = { at: Date.now(), step: undefined as string | undefined, steps: 0, model: startModel(cli, cmd, extraEnv.CODEX_HOME) };
+  const act = { at: Date.now(), step: undefined as string | undefined, steps: 0, model: startModel(cli, cmd, extraEnv.CODEX_HOME), retries: 0, retryError: "" };
   const inFlight = new Map<string, string>(); // tool_use id → tool name, until its result comes back
   let resultText: string | undefined, assistantText = "";
   const touch = () => {
@@ -203,9 +203,16 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
     if (tid) agentActivity.set(tid, { at: new Date(act.at).toISOString(), step: act.step, steps: act.steps, model: act.model });
   };
   touch();
-  const onLine = (line: string) => {
+  // Claude Code's own API retries are not progress: each one follows a request that hung until it timed out, so a run
+  // stuck on a dead API would otherwise look alive for the whole run limit (T-0565: 4 runs × 90 min, 1-3 tool calls each)
+  const onLine = (line: string): boolean => {
     let e: any;
-    try { e = JSON.parse(line); } catch { return; }
+    try { e = JSON.parse(line); } catch { return true; }
+    if (e.type === "system" && e.subtype === "api_retry") {
+      act.retries++;
+      act.retryError = String(e.error_status ?? e.error ?? "");
+      return false;
+    }
     if (e.type === "system" && e.subtype === "init" && e.model) act.model = String(e.model);
     if (e.type === "assistant") {
       if (e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
@@ -220,7 +227,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
       // may be followed by "that notification changes nothing"
       const text = typeof e.result === "string" ? e.result : "";
       resultText = resultText === undefined ? text : `${resultText}\n\n${text}`;
-    }
+    }    return true;
   };
   // the log exists from the start and grows with stdout, so a long or killed run still leaves its transcript;
   // a failed write only loses that early copy, the full log is written again at exit
@@ -238,8 +245,10 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
         buf += t;
         const parts = buf.split("\n");
         buf = parts.pop()!;
-        parts.forEach(onLine);
+        const alive = parts.map(onLine).some(Boolean) || (!parts.length && !!buf);
         if (log && parts.length) logPart(parts.map(stripImages).join("\n") + "\n");
+        if (alive) touch();
+        continue;
       } else if (log) logPart(t);
       touch();
     }
@@ -254,7 +263,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const watch = setInterval(() => {
     const slow = [...inFlight.values()].some((n) => /^(Task|Agent)$/.test(n));
     if (!slow && Date.now() - act.at > stallMs) { stalled = true; proc.kill(); }
-  }, 30_000);
+  }, Math.min(30_000, Math.max(1_000, stallMs / 2)));
   const [raw, err] = await Promise.all([read(proc.stdout, json, true), read(proc.stderr, false)]);
   const code = await proc.exited;
   clearTimeout(timer);
@@ -263,8 +272,10 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const logged = json ? raw.split("\n").map(stripImages).join("\n") : raw;
   writeFileSync(logFile, `$ ${cmd.join(" ")}\n(exit ${code})\n\n${logged}\n\n[stderr]\n${err}`);
   const out = json ? (resultText ?? assistantText) : raw;
-  if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${act.step ? `; last step: ${act.step}` : ""}; run long builds in the background and return "waiting"`;
-  if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${act.step ? `; last step: ${act.step}` : ""}`;
+  // name the API retries first: "last step" is only where the run was when the API went away, not what hung
+  const retried = act.retries ? `; the CLI retried the API ${act.retries}× (last error: ${act.retryError || "unknown"})` : "";
+  if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${retried}${act.step ? `; last step: ${act.step}` : ""}; run long builds in the background and return "waiting"`;
+  if (stalled) return `${out}${STALLED} no progress for ${Math.round(stallMs / 60_000)} minutes${retried}${act.step ? `; last step: ${act.step}` : ""}`;
   // A provider occasionally answers with an empty completion (no text, no tool call, exit 0) and Claude Code's own
   // "no visible output" retry gets nothing either. That is a flake of the tool chain, not the task failing: rerun the
   // same prompt once, and never hand the empty run back to the caller as the task's result.

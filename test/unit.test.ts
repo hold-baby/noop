@@ -506,3 +506,26 @@ test("lessons sent as a bare string are kept, not fatal", async () => {
   expect(() => remember("crashguard-test", undefined, "T-3")).not.toThrow();
   expect(() => remember("crashguard-test", { length: 2 } as any, "T-4")).not.toThrow(); // no write, no crash
 });
+
+test("a run that only keeps retrying a dead API is stopped as stalled and says so", async () => {
+  // Each api_retry line follows a request that hung until it timed out; counting them as output let a run sit for the
+  // whole run limit with 1-3 tool calls (T-0565, 2026-11-13: 4 runs × 90 min). They must not reset the stall clock.
+  const dir = mkdtempSync(`${tmpdir()}/noop-api-retry-`);
+  const retry = JSON.stringify({ type: "system", subtype: "api_retry", attempt: 1, max_retries: 10, error_status: null, error: "unknown" });
+  const script = `setInterval(() => process.stdout.write(${JSON.stringify(`${retry}\n`)}), 200);`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] }, stall_minutes: 0.03 } } as unknown as Cfg;
+  try {
+    const out = await runAgent("fake", "prompt", dir, cfg, `${dir}/run.log`);
+    expect(out).toContain("[stalled]");
+    expect(out).toMatch(/retried the API \d+× \(last error: unknown\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("Claude's expired OAuth session asks for a login instead of failing tasks one by one", async () => {
+  const { classify } = await import("../src/accounts");
+  // 2026-11-13 15:29-17:05: four own-prs-ci tasks lost to this line, each retried and failed again
+  expect(classify("Failed to authenticate: OAuth session expired and could not be refreshed\n[exit 1]")).toBe("auth");
+  expect(classify("OAuth token has expired")).toBe("auth");
+});

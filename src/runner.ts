@@ -216,8 +216,10 @@ export function stripImages(line: string): string {
   return hit ? JSON.stringify(e) : line;
 }
 
-/** A run that died before reaching the provider — no tokens spent, no tool ran, so it is safe to spawn again. */
-const UNREACHABLE = /Can't reach the API server|connection_failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|getaddrinfo/i;
+/** A run that died before reaching the provider — no tokens spent, no tool ran, so it is safe to spawn again.
+ *  Also covers Claude's 403 edge block (a VPN or proxy briefly exiting in an unsupported region) and the managed-settings
+ *  race at start-up ("still loading your organization's settings… usually takes a few seconds"). */
+const UNREACHABLE = /Can't reach the API server|connection_failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|getaddrinfo|network_edge_blocked|Request blocked before it reached|still loading your organization's settings/i;
 
 /** Marker for a quiet process that should use the bounded stall-retry path. */
 export const STALLED = "\n[stalled]";
@@ -280,7 +282,8 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
       if (e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
       for (const c of e.message?.content ?? []) {
         if (c.type === "tool_use") { inFlight.set(c.id, c.name); act.step = toolStep(c.name, c.input); act.steps++; }
-        else if (c.type === "text" && !e.parent_tool_use_id) assistantText += c.text;
+        // "<synthetic>" messages are the CLI echoing its own error (e.g. the 403 edge block), not the model speaking
+        else if (c.type === "text" && !e.parent_tool_use_id && e.message?.model !== "<synthetic>") assistantText += c.text;
       }
     } else if (e.type === "user") {
       for (const c of e.message?.content ?? []) if (c.type === "tool_result") inFlight.delete(c.tool_use_id);

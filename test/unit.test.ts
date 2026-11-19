@@ -434,6 +434,33 @@ test("a run that never reached the API is retried once instead of failing the ta
   }
 }, 20_000);
 
+for (const [name, out, err] of [
+  ["Claude's 403 edge block", [
+    { type: "assistant", message: { model: "<synthetic>", role: "assistant", content: [{ type: "text", text: "API Error: Request blocked before it reached Anthropic's API (HTTP 403)" }] } },
+    { type: "result", is_error: true, api_error: "network_edge_blocked", result: "API Error: Request blocked before it reached Anthropic's API (HTTP 403) \u00b7 the network this request came from isn't allowed" },
+  ], ""],
+  ["the organization-settings race at start-up", [{ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0 }],
+    "Claude Code is still loading your organization's settings. Acme requires them before a session can start; this usually takes a few seconds."],
+] as const) {
+  test(`a run stopped by ${name} before any turn is retried once`, async () => {
+    const dir = mkdtempSync(`${tmpdir()}/noop-edge-`);
+    const mark = `${dir}/ran`;
+    const down = out.map((e) => JSON.stringify(e)).join("\n");
+    const block = JSON.stringify({ type: "result", result: '```json\n{"status":"done","summary":"second try"}\n```' });
+    const script = `const fs = require("node:fs");`
+      + `if (fs.existsSync(${JSON.stringify(mark)})) process.stdout.write(${JSON.stringify(`${block}\n`)});`
+      + `else { fs.writeFileSync(${JSON.stringify(mark)}, ""); process.stdout.write(${JSON.stringify(`${down}\n`)}); process.stderr.write(${JSON.stringify(err)}); process.exit(1); }`;
+    const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+    const log = `${dir}/run.log`;
+    try {
+      const res = parseResult(await runAgent("fake", "prompt", dir, cfg, log));
+      expect(res).toMatchObject({ status: "done", summary: "second try" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+}
+
 test("a run stopped by its work limit uses a distinct checkpoint marker", async () => {
   const dir = mkdtempSync(`${tmpdir()}/noop-run-limit-`);
   const script = `setTimeout(() => {}, 5000)`;

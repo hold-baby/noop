@@ -130,10 +130,15 @@ export function accountEnv(a: Account): Record<string, string> {
 const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|no credits remaining|insufficient credits|purchase more credits|\b402\b|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)(?! (?:a|a few|some) (?:moments?|bit|while|seconds?|minutes?)\b)/i;
 const AUTH = /not logged in|please run \/login|invalid api key|authentication[_ ]error|\b401\b|oauth (token|session) (has )?expired|login required|unauthorized|codex login/i;
 
-export type Failure = "quota" | "auth" | null;
+/** Claude's edge refuses the host's egress network (VPN/proxy region). It lasts hours and hits every account on the
+ *  host at once (T-0766…T-0814, 2026-11-19..20): an immediate rerun gets the same 403 and burns the task's attempts. */
+const NETWORK = /network_edge_blocked|network this request came from isn't allowed/i;
+
+export type Failure = "quota" | "auth" | "network" | null;
 
 export function classify(output: string): Failure {
   const tail = output.slice(-4000);
+  if (NETWORK.test(tail)) return "network";
   if (AUTH.test(tail)) return "auth";
   if (QUOTA.test(tail)) return "quota";
   return null;
@@ -167,7 +172,10 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
   st.last_error = output.slice(-300);
   st.cred = credStamp(a);
   const gateway = kind === "auth" && usesGateway(a);
-  if (kind === "quota") {
+  if (kind === "network") {
+    st.cooldown_until = st.cooldown_until && Date.parse(st.cooldown_until) > Date.now() ? st.cooldown_until : new Date(Date.now() + 30 * 60_000).toISOString();
+    journal(host, `${key(a)} blocked by the API edge (network/region) → cooldown until ${st.cooldown_until.slice(11, 16)}Z`);
+  } else if (kind === "quota") {
     st.cooldown_until = quotaCooldownUntil(st.cooldown_until, output);
     journal(host, `${key(a)} hit usage limit → cooldown until ${st.cooldown_until.slice(11, 16)}Z`);
     if (st.told !== st.cooldown_until) {

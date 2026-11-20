@@ -53,3 +53,11 @@ test("concurrent quota failures retain one cooldown and notification key", () =>
   expect(quotaCooldownUntil(until, "try again in 2h")).toBe(until);
   expect(Date.parse(quotaCooldownUntil("2000-01-01", "usage limit"))).toBeGreaterThan(Date.now());
 });
+
+test("Claude's 403 edge block (egress network/region) is a network wall, not a task failure", () => {
+  // T-0814, 2026-11-20: the same 403 on both hosts 40 minutes apart; replaying at once only burns the task's attempts
+  const out = JSON.stringify({ type: "result", is_error: true, api_error: "network_edge_blocked",
+    result: "API Error: Request blocked before it reached Anthropic's API (HTTP 403) · the network this request came from isn't allowed: usually an unsupported region, or a VPN, proxy or hosting network · signing in again won't change this · check your VPN or network and retry" });
+  expect(classify(out)).toBe("network");
+  expect(classify("API Error: 403 Forbidden")).toBeNull();
+});

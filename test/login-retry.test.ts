@@ -10,6 +10,7 @@ test("first linkless exit tells the owner the local fix once", () => {
   const r = loginExitNotice({ ...base, fails: 1 });
   expect(r.notify).toBeDefined();
   expect(r.notify).toContain("claude /login");
+  expect(r.notify).toMatch(/next in 30 min|约 30 分钟后/); // retryLogins waits loginBackoffMs(1) after the first failure
   expect(r.notify).not.toMatch(/new link will follow|稍后会再发新链接/);
   expect(r.journal).toContain("before printing a link");
   expect(r.journal).toContain("boom");

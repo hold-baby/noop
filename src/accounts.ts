@@ -237,6 +237,8 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
         `${a.cli === "claude" ? "Claude" : "Codex"}（${host}）使用 API 网关鉴权，网关拒绝了令牌，任务暂时交给 ${other}。这里不适用 OAuth 登录，不会再发登录链接；请更换 ${where} 里的令牌。`)].join("\n"), cfg, { kind: "notice" });
     }
   } else {
+    // a fresh outage starts a fresh streak, however the last one was recovered, so the owner is told again
+    if (!st.needs_login) st.login_fails = undefined;
     st.needs_login = true;
     journal(host, `🔑 ${key(a)} needs login`);
   }
@@ -347,7 +349,7 @@ export function loginExitNotice(o: { id: string; account: string; cli: string; h
   const journalLine = `${o.account} login ${o.id} exited (${o.code}) before printing a link, attempt ${o.fails} in a row; output: ${tail || "(none)"}`;
   if (o.fails !== 1) return { journal: journalLine };
   const fix = o.cli === "codex" ? "codex login" : "claude /login";
-  const next = Math.round(loginBackoffMs(o.fails + 1) / 60_000);
+  const next = Math.round(loginBackoffMs(o.fails) / 60_000);
   return { journal: journalLine, notify: L(
     `🔑 The ${o.cli} account on ${o.host} needs to log in, but the login command exited (${o.code}) before giving a link, so it cannot be done remotely. Run \`${fix}\` in a terminal on ${o.host}. Noop retries quietly with growing gaps (next in ${next} min) and will not repeat this message.`,
     `🔑 ${o.host} 上的 ${o.cli} 账户需要登录，但登录命令没给出链接就退出了（exit ${o.code}），没法远程完成。请在 ${o.host} 的终端运行 \`${fix}\`。Noop 会拉长间隔静默重试（下次约 ${next} 分钟后），不再重复这条提醒。`) };

@@ -201,6 +201,14 @@ test("routine dedupe: parked (waiting/blocked) copies never block the next run",
   expect(A.routineQueued("parked")).toBe("");
 });
 
+test("routine dedupe: a stale queued copy whose id already finished does not block", () => {
+  // one machine kept tasks/inbox/T-0201.md after another finished it: the routine was skipped there for a day
+  task("inbox", "T-0201", "routine:stale-copy");
+  expect(A.routineQueued("stale-copy")).toBe("T-0201");
+  task("done", "T-0201", "routine:stale-copy");
+  expect(A.routineQueued("stale-copy")).toBe("");
+});
+
 test("routine dedupe: a checkpointed copy that will resume still blocks the next run", () => {
   // the work-limit checkpoint parks the copy in tasks/waiting, but its pass is not finished: the daemon resumes it,
   // so a copy minted in the meantime runs the same routine twice (T-2270 + T-2274, 2026-11-21)

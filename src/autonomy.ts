@@ -24,6 +24,7 @@ export function needsApproval(cfg: Cfg, source: string): boolean {
 }
 
 const QUEUED = ["inbox", "active", "waiting", "blocked"];
+const FINISHED = ["done", "failed", "rejected"];
 const isRoutine = (m: Record<string, string>, name: string) => (m.source ?? "").replace(/^approved:/, "") === `routine:${name}`;
 
 /** A copy parked by the work-limit checkpoint (src/cli.ts checkpointFallback): its pass is NOT finished — the daemon
@@ -37,6 +38,9 @@ export function routineQueued(name: string, host?: string): string {
   for (const s of QUEUED) for (const p of list(P("tasks", s), /^T-.*\.md$/)) {
     const m = readDoc(p).meta;
     if (!isRoutine(m, name) || (host && m.host !== host)) continue;
+    // a stale duplicate: the same id already finished (a machine kept an old inbox copy after another moved it to done)
+    // would hold the routine back on that machine forever (T-0001/T-0002 on one Mac, 129 skips in a day, 2026-11-24)
+    if (FINISHED.some((f) => existsSync(P("tasks", f, `${m.id}.md`)))) continue;
     // a copy parked on something slow (CI, the owner clicking merge) has finished its pass: the next run must still
     // pick up new PRs/issues instead of the backlog piling up behind it. A work-limit checkpoint is the exception:
     // it resumes, so minting now gives the same routine two concurrent runs (T-2270 + T-2274, 2026-11-21).

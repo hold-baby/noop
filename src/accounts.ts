@@ -13,7 +13,7 @@ const HOME = join(HOME_DIR, "accounts");
 const STATE = join(HOME, "state.json");
 
 export type Account = { cli: string; name: string; dir: string; default?: boolean; auth?: "oauth" | "api" };
-type AState = { cooldown_until?: string; needs_login?: boolean; last_error?: string; login_id?: string; token?: string; cred?: number; told?: string };
+type AState = { cooldown_until?: string; needs_login?: boolean; last_error?: string; login_id?: string; token?: string; cred?: number; told?: string; login_fails?: number };
 type State = { accounts: Record<string, AState>; seq: number; alerted?: Record<string, string> };
 
 const load = (): State => (existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : { accounts: {}, seq: 0 });
@@ -322,12 +322,35 @@ export async function startLogin(a: Account, cfg: Cfg) {
     pending.delete(id);
     const st = load();
     const ok = code === 0;
-    st.accounts[k] = { ...st.accounts[k], needs_login: !ok, login_id: undefined, cooldown_until: undefined };
+    const fails = ok || sent ? 0 : (st.accounts[k]?.login_fails ?? 0) + 1;
+    st.accounts[k] = { ...st.accounts[k], needs_login: !ok, login_id: undefined, cooldown_until: undefined, login_fails: fails || undefined };
     save(st);
-    journal(host, ok ? `${k} logged in (${id})` : `${k} login ${id} failed (exit ${code})`);
-    await notify(ok ? L(`${k} logged in, the fleet continues`, `${k} 登录成功，fleet 继续运转`) : L(`${id} login did not finish (exit ${code}), a new link will follow`, `${id} 登录未完成（exit ${code}），稍后会再发新链接`), cfg);
+    const exit = loginExitNotice({ id, account: k, cli: a.cli, host, code, sent, fails, output: buf });
+    journal(host, exit.journal);
+    if (exit.notify) await notify(exit.notify, cfg);
   });
   setTimeout(() => { if (pending.has(id)) proc.kill(); }, 30 * 60_000); // link expiry
+}
+
+/** Wait before the next login attempt: 30 min, doubling for each attempt in a row that never produced a link, capped at 6 h. */
+export function loginBackoffMs(fails: number): number {
+  return Math.min(30 * 60_000 * 2 ** Math.max(0, fails - 1), 6 * 3600_000);
+}
+
+/** What to journal and tell the owner when a login process exits.
+ *  A login that exits before printing a link cannot be finished remotely: say so once, with the local fix,
+ *  instead of promising "a new link will follow" every 30 minutes (L-0001…L-0086 sent 86 linkless notices). */
+export function loginExitNotice(o: { id: string; account: string; cli: string; host: string; code: number | null; sent: boolean; fails: number; output: string }): { journal: string; notify?: string } {
+  if (o.code === 0) return { journal: `${o.account} logged in (${o.id})`, notify: L(`${o.account} logged in, the fleet continues`, `${o.account} 登录成功，fleet 继续运转`) };
+  if (o.sent) return { journal: `${o.account} login ${o.id} failed (exit ${o.code})`, notify: L(`${o.id} login did not finish (exit ${o.code}), a new link will follow`, `${o.id} 登录未完成（exit ${o.code}），稍后会再发新链接`) };
+  const tail = o.output.replace(/sk-ant-[\w-]+/g, "sk-ant-***").replace(/\s+/g, " ").trim().slice(-300);
+  const journalLine = `${o.account} login ${o.id} exited (${o.code}) before printing a link, attempt ${o.fails} in a row; output: ${tail || "(none)"}`;
+  if (o.fails !== 1) return { journal: journalLine };
+  const fix = o.cli === "codex" ? "codex login" : "claude /login";
+  const next = Math.round(loginBackoffMs(o.fails + 1) / 60_000);
+  return { journal: journalLine, notify: L(
+    `🔑 The ${o.cli} account on ${o.host} needs to log in, but the login command exited (${o.code}) before giving a link, so it cannot be done remotely. Run \`${fix}\` in a terminal on ${o.host}. Noop retries quietly with growing gaps (next in ${next} min) and will not repeat this message.`,
+    `🔑 ${o.host} 上的 ${o.cli} 账户需要登录，但登录命令没给出链接就退出了（exit ${o.code}），没法远程完成。请在 ${o.host} 的终端运行 \`${fix}\`。Noop 会拉长间隔静默重试（下次约 ${next} 分钟后），不再重复这条提醒。`) };
 }
 
 export const pendingLoginIds = () => new Set(pending.keys());
@@ -358,7 +381,7 @@ export async function retryLogins(cfg: Cfg) {
       continue;
     }
     // back off: a login that exits immediately would otherwise send a new link every tick
-    if (Date.now() - (lastLoginTry.get(key(a)) ?? 0) < 30 * 60_000) continue;
+    if (Date.now() - (lastLoginTry.get(key(a)) ?? 0) < loginBackoffMs(st.login_fails ?? 0)) continue;
     lastLoginTry.set(key(a), Date.now());
     await startLogin(a, cfg);
   }

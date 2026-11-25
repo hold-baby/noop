@@ -172,10 +172,15 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false, mcpArgs:
     return cmd;
   }
   if (cli === "codex") {
-    // non-interactive: workspace-write sandbox with network, never ask for approval
-    const cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write",
-      "-c", 'approval_policy="never"', "-c", "sandbox_workspace_write.network_access=true"];
-    for (const dir of codexWritableDirs(homedir(), cfg.resources?.work_dirs)) cmd.push("--add-dir", dir);
+    // non-interactive, never ask for approval. Default: workspace-write sandbox with network. `[clis.codex] sandbox =
+    // "danger-full-access"` lets codex do host chores (brew installs, /Applications, simulators, keychain) the way claude's
+    // bypassPermissions already does; it is the owner's call, so the default stays sandboxed.
+    const sandbox = c.sandbox === "danger-full-access" ? "danger-full-access" : "workspace-write";
+    const cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "--sandbox", sandbox, "-c", 'approval_policy="never"'];
+    if (sandbox === "workspace-write") {
+      cmd.push("-c", "sandbox_workspace_write.network_access=true");
+      for (const dir of codexWritableDirs(homedir(), cfg.resources?.work_dirs)) cmd.push("--add-dir", dir);
+    }
     if (c.model) cmd.push("-m", c.model);
     cmd.push(...mcpArgs);
     return [...cmd, "-"];

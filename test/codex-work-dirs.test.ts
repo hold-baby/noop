@@ -42,3 +42,15 @@ test("the codex command passes the configured work_dirs as --add-dir", () => {
   expect(cmd.at(-1)).toBe("-");
   expect(() => cliCommand("codex", {} as any)).not.toThrow(); // no [resources] section at all
 });
+
+test("codex stays in the workspace-write sandbox unless the owner opts into full access", () => {
+  const def = cliCommand("codex", {} as any);
+  expect(def[def.indexOf("--sandbox") + 1]).toBe("workspace-write");
+  expect(def).toContain("sandbox_workspace_write.network_access=true");
+  const typo = cliCommand("codex", { clis: { codex: { sandbox: "full" } } } as any);
+  expect(typo[typo.indexOf("--sandbox") + 1]).toBe("workspace-write"); // unknown values never widen access
+  const full = cliCommand("codex", { clis: { codex: { sandbox: "danger-full-access" } }, resources: { work_dirs: [tmp("noop-repos-")] } } as any);
+  expect(full[full.indexOf("--sandbox") + 1]).toBe("danger-full-access");
+  expect(full).not.toContain("--add-dir"); // nothing to add outside a sandbox
+  expect(full.at(-1)).toBe("-");
+});

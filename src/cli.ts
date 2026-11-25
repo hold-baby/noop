@@ -875,6 +875,8 @@ For each task decide:
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
 - cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
+  Codex runs sandboxed to the work dirs: anything that installs software (brew, /Applications), drives simulators, uses the keychain
+  or changes system settings needs "claude".
   A suggestion only — never pick against an agent's fixed CLI below. Installed in this fleet: ${clis.join(", ") || "(unknown)"}; never suggest another.
 - difficulty: "hard" or "normal".
 ${fixed.size ? `\nAgent CLI (the owner's setting — not yours to change):\n${[...fixed].map(([a, c]) => `- ${a}: fixed to ${c.join(" → ")} (leave cli out)`).join("\n")}\n` : ""}
